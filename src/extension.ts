@@ -43,7 +43,7 @@ async function checkPortAvailable(host: string, port: number): Promise<boolean> 
  */
 async function isMgraftcpRunning(): Promise<boolean> {
 	try {
-		const { stdout } = await execAsync('pgrep -f mgraftcp');
+		const { stdout } = await execAsync("pgrep -f '[m]graftcp'");
 		return stdout.trim().length > 0;
 	} catch {
 		// pgrep returns non-zero if no process found
@@ -56,38 +56,50 @@ async function isMgraftcpRunning(): Promise<boolean> {
  * Returns PID and whether it's running in persistent mode
  * 
  * When LS runs through mgraftcp, ps shows two processes:
- * 1. mgraftcp process (parent, contains "language_server_linux" as argument)
- * 2. actual language_server process (child, the .bak binary)
+ * 1. mgraftcp process (parent, contains binary name as argument)
+ * 2. actual language_server or agy process (child, the .bak binary)
  * 
  * We need to find the actual LS process and determine if it was started via mgraftcp
  */
-async function getLanguageServerProcess(): Promise<{ pid: number; isPersistent: boolean; isUsingProxy: boolean } | null> {
+async function getLanguageServerProcess(): Promise<{ pid: number; isPersistent: boolean; isUsingProxy: boolean; isProxied: boolean } | null> {
 	try {
-		const { stdout } = await execAsync('ps aux | grep language_server_linux | grep -v grep');
+		const { stdout } = await execAsync("ps aux | grep -E '(language_server_linux|\\.gemini/bin/agy(\\.bak)?\\s+--hub)' | grep -v grep");
 		const lines = stdout.trim().split('\n').filter(l => l.length > 0);
 		
 		// First pass: check if mgraftcp is wrapping the LS (indicates proxy is active)
 		const hasMgraftcpWrapper = lines.some(line => line.includes('mgraftcp'));
 		
-		// Second pass: find the actual LS process (not the mgraftcp line)
-		for (const line of lines) {
-			// Skip the mgraftcp wrapper line, we want the actual LS binary
+		// Prioritize v2.6.0+ (.gemini/bin/agy) over legacy language_server_linux if both exist
+		const sortedLines = [...lines].sort((a, b) => {
+			const aIsAgy = a.includes('.gemini/bin/agy') ? 0 : 1;
+			const bIsAgy = b.includes('.gemini/bin/agy') ? 0 : 1;
+			return aIsAgy - bIsAgy;
+		});
+
+		// Second pass: find the actual LS/agy process (not the mgraftcp line)
+		for (const line of sortedLines) {
+			// Skip the mgraftcp wrapper line, we want the actual binary
 			if (line.includes('mgraftcp-fakedns')) {
 				continue;
 			}
 			
-			// Look for the actual language_server process (either direct or .bak)
-			if (line.includes('language_server_linux')) {
+			// Look for the actual language_server or agy hub process (either direct or .bak)
+			const isAgy = line.includes('.gemini/bin/agy') && line.includes('--hub');
+			const isLegacy = line.includes('language_server_linux');
+
+			if (isAgy || isLegacy) {
 				const parts = line.split(/\s+/);
 				if (parts.length >= 2) {
 					const pid = parseInt(parts[1]);
-					const isPersistent = line.includes('--persistent_mode') || line.includes('persistent_mode');
+					const isPersistent = isAgy || line.includes('--persistent_mode') || line.includes('persistent_mode');
+					const isProxied = line.includes('.bak') || line.includes('mgraftcp') || hasMgraftcpWrapper;
 					
 					if (!isNaN(pid)) {
 						return { 
 							pid, 
 							isPersistent, 
-							isUsingProxy: hasMgraftcpWrapper 
+							isUsingProxy: isProxied,
+							isProxied
 						};
 					}
 				}
@@ -112,16 +124,20 @@ async function killLanguageServer(): Promise<boolean> {
 	
 	try {
 		log(`Killing Language Server process (PID: ${lsProcess.pid}, persistent: ${lsProcess.isPersistent})`);
-		await execAsync(`kill ${lsProcess.pid}`);
+		await execAsync(`kill ${lsProcess.pid}`).catch(() => {});
+		await execAsync("pkill -f '[l]anguage_server_linux'").catch(() => {});
+		await execAsync("pkill -f '[.]gemini/bin/agy(\\.bak)?.*--hub'").catch(() => {});
 		
 		// Wait a bit for process to terminate
 		await new Promise(resolve => setTimeout(resolve, 1000));
 		
 		// Verify it's gone
 		const stillRunning = await getLanguageServerProcess();
-		if (stillRunning && stillRunning.pid === lsProcess.pid) {
+		if (stillRunning) {
 			log('Process still running, using SIGKILL');
-			await execAsync(`kill -9 ${lsProcess.pid}`);
+			await execAsync(`kill -9 ${stillRunning.pid}`).catch(() => {});
+			await execAsync("pkill -9 -f '[l]anguage_server_linux'").catch(() => {});
+			await execAsync("pkill -9 -f '[.]gemini/bin/agy(\\.bak)?.*--hub'").catch(() => {});
 		}
 		
 		log('Language Server process killed successfully');
@@ -521,7 +537,7 @@ async function activateRemote(context: vscode.ExtensionContext) {
 	if (showStatusOnStartup) {
 		// Delay slightly to let setup complete
 		setTimeout(async () => {
-			await showStartupStatus(remoteHost, remotePort);
+			await showStartupStatus(remoteHost, remotePort, setupSuccess);
 		}, 2000);
 	}
 }
@@ -585,7 +601,7 @@ async function showSSHTunnelNotEstablishedWarning(proxyHost: string, proxyPort: 
 /**
  * Show startup status notification with detailed diagnostics in output channel
  */
-async function showStartupStatus(proxyHost: string, proxyPort: number): Promise<void> {
+async function showStartupStatus(proxyHost: string, proxyPort: number, setupSuccess: boolean = true): Promise<void> {
 	try {
 		log('');
 		log('========== Startup Status Check ==========');
@@ -693,7 +709,10 @@ async function showStartupStatus(proxyHost: string, proxyPort: number): Promise<
 		const lsIsPersistent = lsProcessForDecision?.isPersistent ?? false;
 		const lsNeedsRestart = lsProcessForDecision && lsIsPersistent && !lsActuallyUsingProxy;
 
-		if (proxyReachable && lsActuallyUsingProxy) {
+		if (!setupSuccess) {
+			message = `⚠️ Proxy wrapper setup failed. Check output logs or run Diagnostics.`;
+			actions = ['Run Diagnostics', 'Dismiss'];
+		} else if (proxyReachable && lsActuallyUsingProxy) {
 			// Everything is actually working - LS is using proxy
 			message = `✅ Proxy active (${proxyHost}:${proxyPort})`;
 		} else if (proxyReachable && lsNeedsRestart) {
@@ -703,13 +722,17 @@ async function showStartupStatus(proxyHost: string, proxyPort: number): Promise<
 			
 			const killed = await killLanguageServer();
 			if (killed) {
-				message = `🔄 Language Server restarted to enable proxy. Reloading...`;
-				actions = ['Reload Now'];
-				
-				// Auto-reload after a short delay
-				setTimeout(() => {
-					vscode.commands.executeCommand('workbench.action.reloadWindow');
-				}, 2000);
+				// Wait briefly for Antigravity IDE v2.6.0+ auto-recovery to respawn agy through wrapper
+				await new Promise(resolve => setTimeout(resolve, 1500));
+				const rechecked = await getLanguageServerProcess();
+				if (rechecked?.isUsingProxy) {
+					log('Startup: Language Server auto-recovered with proxy active');
+					message = `✅ Proxy active (${proxyHost}:${proxyPort})`;
+					actions = [];
+				} else {
+					message = `🔄 Language Server restarted to enable proxy. Please reload window.`;
+					actions = ['Reload Now', 'Dismiss'];
+				}
 			} else {
 				message = `⚠️ Proxy configured but Language Server needs manual restart.`;
 				actions = ['Kill & Reload', 'Dismiss'];
@@ -808,23 +831,33 @@ async function runSetupScriptSilently(proxyHost: string, proxyPort: number, prox
 			(output.includes('configured') && !output.includes('Already configured'));
 
 		if (isNewConfig) {
-			// New configuration or version update - need to restart LS
+			// New configuration or version update - setup-proxy.sh terminates old processes
 			log('Setup: New configuration applied');
 			
-			// Check if LS is in persistent mode - if so, need to kill it first
-			// Otherwise the new wrapper won't take effect even after reload
+			// Wait briefly in case Antigravity IDE v2.6.0+ auto-recovered agy through the new wrapper
+			await new Promise(resolve => setTimeout(resolve, 1500));
 			const lsProcess = await getLanguageServerProcess();
-			if (lsProcess && lsProcess.isPersistent) {
-				log('Setup: LS is in persistent_mode, killing to apply new configuration');
+			if (lsProcess && lsProcess.isUsingProxy) {
+				log('Setup: Language Server auto-recovered with proxy active, no reload needed');
+				return true;
+			}
+			if (lsProcess && lsProcess.isPersistent && !lsProcess.isUsingProxy) {
+				log('Setup: LS is in persistent_mode without proxy, killing to apply new configuration');
 				const killed = await killLanguageServer();
 				if (killed) {
+					await new Promise(resolve => setTimeout(resolve, 1500));
+					const rechecked = await getLanguageServerProcess();
+					if (rechecked?.isUsingProxy) {
+						log('Setup: Language Server auto-recovered with proxy active after kill');
+						return true;
+					}
 					promptReloadWindow(
 						'Antigravity proxy updated. Language Server restarted. Please reload the window to reconnect.'
 					);
 				} else {
 					vscode.window.showWarningMessage(
 						'Proxy updated but Language Server needs restart. ' +
-						'Run in terminal: kill $(pgrep -f language_server_linux) && then reload window.',
+						'Run in terminal: pkill -f language_server_linux || pkill -f agy && then reload window.',
 						'Reload Now'
 					).then(selection => {
 						if (selection === 'Reload Now') {
@@ -866,7 +899,7 @@ async function runSetupScriptSilently(proxyHost: string, proxyPort: number, prox
 						// Fallback to manual instructions
 						vscode.window.showWarningMessage(
 							'Proxy configured but Language Server needs restart. ' +
-							'Run in terminal: kill $(pgrep -f language_server_linux) && then reload window.',
+							'Run in terminal: pkill -f language_server_linux || pkill -f agy && then reload window.',
 							'Reload Now'
 						).then(selection => {
 							if (selection === 'Reload Now') {
