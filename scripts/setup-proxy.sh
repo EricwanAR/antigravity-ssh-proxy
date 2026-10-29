@@ -214,6 +214,39 @@ is_wrapper_script() {
     grep -qE "(ANTIGRAVITY_SSH_PROXY_WRAPPER|WRAPPER_VERSION=|mgraftcp-fakedns)" "$target" 2>/dev/null
 }
 
+# Sync ~/.gemini/bin/agy.version.json sidecar stats (size, mtimeMs, ino) with the wrapper script
+# so Antigravity IDE v2.6.0+ sidecar validation (doesSidecarMatchStats) succeeds without rewriting it
+sync_agy_version_sidecar() {
+    local target="$1"
+    local sidecar="${target}.version.json"
+    [ -f "$sidecar" ] || return 0
+
+    local size mtime_sec ino mtime_ms
+    read -r size mtime_sec ino <<< "$(stat -c '%s %Y %i' "$target" 2>/dev/null || true)"
+    if [ -z "$size" ] || [ -z "$mtime_sec" ] || [ -z "$ino" ]; then
+        return 0
+    fi
+    mtime_ms="${mtime_sec}000"
+
+    # Skip write if size and ino in sidecar already match the target file
+    if grep -qE "\"size\"[[:space:]]*:[[:space:]]*${size}(,|$)" "$sidecar" 2>/dev/null && \
+       grep -qE "\"ino\"[[:space:]]*:[[:space:]]*${ino}(,|$)" "$sidecar" 2>/dev/null; then
+        return 0
+    fi
+
+    local sidecar_tmp="${sidecar}.tmp.$$"
+    if sed -E \
+        -e "s/(\"size\"[[:space:]]*:[[:space:]]*)[0-9]+/\1${size}/" \
+        -e "s/(\"mtimeMs\"[[:space:]]*:[[:space:]]*)[0-9]+(\.[0-9]+)?/\1${mtime_ms}/" \
+        -e "s/(\"ino\"[[:space:]]*:[[:space:]]*)[0-9]+/\1${ino}/" \
+        "$sidecar" > "$sidecar_tmp" 2>/dev/null; then
+        mv -f "$sidecar_tmp" "$sidecar"
+        debug_log "Synced sidecar metadata: $sidecar (size=$size, mtimeMs=$mtime_ms, ino=$ino)"
+    else
+        rm -f "$sidecar_tmp" 2>/dev/null || true
+    fi
+}
+
 # Determine if wrapper needs to be updated
 # Returns: 0 = needs update (with reason in stdout), 1 = up-to-date
 check_needs_update() {
@@ -337,6 +370,7 @@ while IFS= read -r TARGET; do
         fi
     else
         # Already up-to-date
+        sync_agy_version_sidecar "$TARGET"
         info_log "Already up-to-date (v$EXTENSION_VERSION, $PROXY_ADDR, $PROXY_TYPE)"
         SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
         continue
@@ -502,6 +536,7 @@ WRAPPER_EOF
 
     chmod +x "$WRAPPER_TMP"
     mv -f "$WRAPPER_TMP" "$TARGET"
+    sync_agy_version_sidecar "$TARGET"
     info_log "Wrapper created successfully"
     info_log "  Version: $EXTENSION_VERSION"
     info_log "  Proxy: $PROXY_ADDR ($PROXY_TYPE)"
@@ -516,7 +551,11 @@ if [ $CONFIGURED_COUNT -gt 0 ]; then
     info_log "Terminating running language server and agy processes to apply new wrapper..."
     pkill -f "[l]anguage_server_linux.*\.bak" 2>/dev/null || true
     pkill -f "[l]anguage_server_linux" 2>/dev/null || true
-    pkill -f "[.]gemini/bin/agy(\.bak)?.*--hub" 2>/dev/null || true
+    if [ "${SKIP_AGY_KILL:-0}" != "1" ]; then
+        pkill -f "[.]gemini/bin/agy(\.bak)?.*--hub" 2>/dev/null || true
+    else
+        debug_log "Skipping immediate agy kill (managed by extension host for safe auto-recovery)"
+    fi
 fi
 
 # ============================================================================

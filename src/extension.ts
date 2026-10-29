@@ -3,6 +3,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { watch as fsWatch, FSWatcher } from 'fs';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { generateSetupScript, generateRollbackScript } from './remoteSetup';
@@ -115,29 +116,35 @@ async function getLanguageServerProcess(): Promise<{ pid: number; isPersistent: 
  * Kill Language Server process to force restart through wrapper
  * This is needed when LS is running in persistent_mode and was started before wrapper was configured
  */
-async function killLanguageServer(): Promise<boolean> {
+async function killLanguageServer(targetPid?: number): Promise<boolean> {
 	const lsProcess = await getLanguageServerProcess();
-	if (!lsProcess) {
+	if (!lsProcess && targetPid === undefined) {
 		log('No Language Server process found to kill');
 		return false;
 	}
+	const pidToKill = targetPid ?? lsProcess!.pid;
 	
 	try {
-		log(`Killing Language Server process (PID: ${lsProcess.pid}, persistent: ${lsProcess.isPersistent})`);
-		await execAsync(`kill ${lsProcess.pid}`).catch(() => {});
+		log(`Killing Language Server process (PID: ${pidToKill}, persistent: ${lsProcess?.isPersistent ?? true})`);
+		await execAsync(`kill ${pidToKill}`).catch(() => {});
 		await execAsync("pkill -f '[l]anguage_server_linux'").catch(() => {});
 		await execAsync("pkill -f '[.]gemini/bin/agy(\\.bak)?.*--hub'").catch(() => {});
 		
-		// Wait a bit for process to terminate
-		await new Promise(resolve => setTimeout(resolve, 1000));
+		// Wait briefly for process to terminate on SIGTERM
+		await new Promise(resolve => setTimeout(resolve, 700));
 		
-		// Verify it's gone
-		const stillRunning = await getLanguageServerProcess();
-		if (stillRunning) {
-			log('Process still running, using SIGKILL');
-			await execAsync(`kill -9 ${stillRunning.pid}`).catch(() => {});
+		// Only SIGKILL if the original target PID is still alive (avoid killing a newly respawned agy process)
+		let originalStillAlive = false;
+		try {
+			process.kill(pidToKill, 0);
+			originalStillAlive = true;
+		} catch {
+			originalStillAlive = false;
+		}
+		if (originalStillAlive) {
+			log(`Process ${pidToKill} still running after SIGTERM, using SIGKILL`);
+			await execAsync(`kill -9 ${pidToKill}`).catch(() => {});
 			await execAsync("pkill -9 -f '[l]anguage_server_linux'").catch(() => {});
-			await execAsync("pkill -9 -f '[.]gemini/bin/agy(\\.bak)?.*--hub'").catch(() => {});
 		}
 		
 		log('Language Server process killed successfully');
@@ -146,6 +153,108 @@ async function killLanguageServer(): Promise<boolean> {
 		log(`Failed to kill Language Server: ${error}`);
 		return false;
 	}
+}
+
+/**
+ * Poll for Language Server / agy process to come back up using the proxy wrapper
+ * (Antigravity IDE v2.6.0+ auto-recovery respawns agy after ~0.8-1.2s backoff)
+ */
+async function waitForProxiedLanguageServer(
+	timeoutMs: number = 3500,
+	excludePid?: number
+): Promise<{ pid: number; isPersistent: boolean; isUsingProxy: boolean; isProxied: boolean } | null> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const proc = await getLanguageServerProcess();
+		if (proc && proc.isUsingProxy && (excludePid === undefined || proc.pid !== excludePid)) {
+			return proc;
+		}
+		await new Promise(resolve => setTimeout(resolve, 400));
+	}
+	return await getLanguageServerProcess();
+}
+
+const AGY_INSTALL_LOCK_STALE_MS = 15 * 60 * 1000;
+
+function getGeminiBinDir(): string {
+	return path.join(os.homedir(), '.gemini', 'bin');
+}
+
+function getAgyBinaryPath(): string {
+	return path.join(getGeminiBinDir(), 'agy');
+}
+
+function getAgyInstallLockPath(): string {
+	return path.join(getGeminiBinDir(), '.agy-install.lock');
+}
+
+/**
+ * Fast check (reads only the first 1KB) to determine whether ~/.gemini/bin/agy
+ * is already our bash wrapper script rather than an raw ELF binary.
+ */
+async function isAgyWrapperConfigured(agyPath: string = getAgyBinaryPath()): Promise<boolean> {
+	try {
+		const handle = await fs.open(agyPath, 'r');
+		try {
+			const buffer = Buffer.alloc(1024);
+			const { bytesRead } = await handle.read(buffer, 0, 1024, 0);
+			const header = buffer.subarray(0, bytesRead).toString('utf-8');
+			return header.includes('ANTIGRAVITY_SSH_PROXY_WRAPPER');
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Check if Antigravity's built-in extension currently holds ~/.gemini/bin/.agy-install.lock
+ */
+async function isAgyInstallLockActive(): Promise<boolean> {
+	const lockPath = getAgyInstallLockPath();
+	try {
+		const raw = await fs.readFile(lockPath, 'utf-8');
+		const payload = JSON.parse(raw) as { pid?: number; hostname?: string; createdAt?: number };
+		if (typeof payload.pid !== 'number' || typeof payload.createdAt !== 'number') {
+			return false;
+		}
+		if (Math.abs(Date.now() - payload.createdAt) > AGY_INSTALL_LOCK_STALE_MS) {
+			return false;
+		}
+		if (payload.hostname === os.hostname()) {
+			try {
+				process.kill(payload.pid, 0);
+				return true;
+			} catch (err: unknown) {
+				return (err as { code?: string })?.code === 'EPERM';
+			}
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Wait if ~/.gemini/bin/.agy-install.lock is currently held by an in-flight IDE backend update
+ */
+async function waitForAgyInstallLock(maxWaitMs: number = 30000): Promise<void> {
+	if (!await isAgyInstallLockActive()) {
+		return;
+	}
+	log('Detected active ~/.gemini/bin/.agy-install.lock (IDE is updating agy backend). Waiting for update to finish...');
+	const deadline = Date.now() + maxWaitMs;
+	while (Date.now() < deadline) {
+		await new Promise(resolve => setTimeout(resolve, 500));
+		if (!await isAgyInstallLockActive()) {
+			// Give writeBinarySidecar (agy.version.json) a brief moment to finish after lock release
+			await new Promise(resolve => setTimeout(resolve, 200));
+			log('Antigravity backend install lock released, proceeding with proxy setup.');
+			return;
+		}
+	}
+	log('Timed out waiting for .agy-install.lock; proceeding and relying on agy.version.json watcher.');
 }
 
 /**
@@ -448,6 +557,87 @@ async function ensureMgraftcpExecutable(extensionPath: string): Promise<void> {
 	}
 }
 
+/**
+ * Watch ~/.gemini/bin/agy.version.json for Antigravity IDE v2.6.0+ backend updates.
+ * The built-in google-antigravity extension writes agy.version.json (via atomic tmp rename)
+ * as the very last step after downloading, verifying, and replacing ~/.gemini/bin/agy.
+ */
+async function watchAgyVersionSidecar(context: vscode.ExtensionContext, extensionPath: string): Promise<void> {
+	const geminiBinDir = getGeminiBinDir();
+	const agyBinaryPath = getAgyBinaryPath();
+
+	try {
+		await fs.mkdir(geminiBinDir, { recursive: true });
+	} catch {
+		// Ignore directory creation errors
+	}
+
+	let debounceTimer: NodeJS.Timeout | undefined;
+	const triggerCheck = (source: string) => {
+		if (debounceTimer) {
+			clearTimeout(debounceTimer);
+		}
+		debounceTimer = setTimeout(async () => {
+			debounceTimer = undefined;
+			try {
+				await waitForAgyInstallLock(15000);
+				try {
+					await fs.access(agyBinaryPath);
+				} catch {
+					return;
+				}
+				const alreadyWrapped = await isAgyWrapperConfigured(agyBinaryPath);
+				if (alreadyWrapped) {
+					return;
+				}
+				log(`[Watcher:${source}] Detected agy.version.json update with unwrapped ~/.gemini/bin/agy (IDE backend updated). Re-applying proxy wrapper...`);
+				const cfg = vscode.workspace.getConfiguration('antigravity-ssh-proxy');
+				const host = cfg.get<string>('remoteProxyHost', '127.0.0.1');
+				const port = cfg.get<number>('remoteProxyPort', 7890);
+				const type = cfg.get<string>('proxyType', 'http');
+				const success = await runSetupScriptSilently(host, port, type, extensionPath);
+				statusManager.updateLanguageServerStatus(success);
+				await statusManager.refreshStatus();
+			} catch (err) {
+				log(`[Watcher:${source}] Error handling agy.version.json update: ${err}`);
+			}
+		}, 400);
+	};
+
+	let fsWatcher: FSWatcher | undefined;
+	try {
+		fsWatcher = fsWatch(geminiBinDir, (_eventType, filename) => {
+			if (filename && filename !== 'agy.version.json') {
+				return;
+			}
+			triggerCheck('fs.watch');
+		});
+		log(`Watching ${geminiBinDir}/agy.version.json for Antigravity backend updates`);
+	} catch (err) {
+		log(`Failed to start fs.watch on ${geminiBinDir}: ${err}`);
+	}
+
+	const vscodeWatcher = vscode.workspace.createFileSystemWatcher(
+		new vscode.RelativePattern(vscode.Uri.file(geminiBinDir), 'agy.version.json')
+	);
+	vscodeWatcher.onDidCreate(() => triggerCheck('vscode.onDidCreate'));
+	vscodeWatcher.onDidChange(() => triggerCheck('vscode.onDidChange'));
+
+	context.subscriptions.push(
+		vscodeWatcher,
+		new vscode.Disposable(() => {
+			if (debounceTimer) {
+				clearTimeout(debounceTimer);
+				debounceTimer = undefined;
+			}
+			if (fsWatcher) {
+				fsWatcher.close();
+				fsWatcher = undefined;
+			}
+		})
+	);
+}
+
 async function activateRemote(context: vscode.ExtensionContext) {
 	const config = vscode.workspace.getConfiguration('antigravity-ssh-proxy');
 	// Remote only cares about remoteProxyHost, remoteProxyPort, and proxyType
@@ -466,6 +656,9 @@ async function activateRemote(context: vscode.ExtensionContext) {
 	// Ensure mgraftcp binary has execute permission before setup
 	await ensureMgraftcpExecutable(extensionPath);
 
+	// Start watching ~/.gemini/bin/agy.version.json before initial setup so no mid-startup update is missed
+	await watchAgyVersionSidecar(context, extensionPath);
+
 	// 设置配置变更回调（用于面板中修改配置时触发）
 	statusManager.setConfigChangeCallback(async () => {
 		const cfg = vscode.workspace.getConfiguration('antigravity-ssh-proxy');
@@ -481,6 +674,9 @@ async function activateRemote(context: vscode.ExtensionContext) {
 
 	// 初始刷新状态
 	await statusManager.refreshStatus();
+
+	// If Antigravity's built-in extension is actively updating ~/.gemini/bin/agy right now, wait for it
+	await waitForAgyInstallLock();
 
 	// Auto-run setup script
 	log(`Extension path: ${extensionPath}`);
@@ -720,11 +916,11 @@ async function showStartupStatus(proxyHost: string, proxyPort: number, setupSucc
 			// Auto-fix by killing LS
 			log('Startup: Detected persistent_mode LS not using proxy, auto-fixing...');
 			
-			const killed = await killLanguageServer();
+			const oldPid = lsProcessForDecision?.pid;
+			const killed = await killLanguageServer(oldPid);
 			if (killed) {
-				// Wait briefly for Antigravity IDE v2.6.0+ auto-recovery to respawn agy through wrapper
-				await new Promise(resolve => setTimeout(resolve, 1500));
-				const rechecked = await getLanguageServerProcess();
+				// Poll for Antigravity IDE v2.6.0+ auto-recovery to respawn agy through wrapper
+				const rechecked = await waitForProxiedLanguageServer(3500, oldPid);
 				if (rechecked?.isUsingProxy) {
 					log('Startup: Language Server auto-recovered with proxy active');
 					message = `✅ Proxy active (${proxyHost}:${proxyPort})`;
@@ -789,11 +985,21 @@ async function showStartupStatus(proxyHost: string, proxyPort: number, setupSucc
 	}
 }
 
+let setupQueuePromise: Promise<boolean> = Promise.resolve(true);
+
 /**
- * Run setup script silently in background (idempotent)
+ * Run setup script silently in background (idempotent and serialized)
  * @returns true if setup was successful or already configured
  */
 async function runSetupScriptSilently(proxyHost: string, proxyPort: number, proxyType: string, extensionPath: string): Promise<boolean> {
+	const nextRun = setupQueuePromise.catch(() => false).then(() =>
+		runSetupScriptSilentlyInner(proxyHost, proxyPort, proxyType, extensionPath)
+	);
+	setupQueuePromise = nextRun;
+	return nextRun;
+}
+
+async function runSetupScriptSilentlyInner(proxyHost: string, proxyPort: number, proxyType: string, extensionPath: string): Promise<boolean> {
 	const scriptPath = path.join(extensionPath, 'scripts', 'setup-proxy.sh');
 
 	try {
@@ -811,14 +1017,20 @@ async function runSetupScriptSilently(proxyHost: string, proxyPort: number, prox
 			log(`Failed to read package.json: ${e}`);
 		}
 
-		// Execute script directly with environment variables for proxy config
+		// Record existing Language Server / agy PID before applying wrapper
+		const pidBeforeSetup = (await getLanguageServerProcess())?.pid;
+
+		// Execute script directly with environment variables for proxy config.
+		// Pass SKIP_AGY_KILL=1 so setup-proxy.sh replaces ~/.gemini/bin/agy and syncs agy.version.json
+		// immediately without killing an agy --hub process that may still be in its initial /healthz probe.
 		const env = {
 			...process.env,
 			PROXY_HOST: proxyHost,
 			PROXY_PORT: String(proxyPort),
 			PROXY_TYPE: proxyType,
 			EXTENSION_PATH: extensionPath,  // Current extension's exact path
-			EXTENSION_VERSION: extensionVersion  // Extension version for update detection
+			EXTENSION_VERSION: extensionVersion,  // Extension version for update detection
+			SKIP_AGY_KILL: '1'
 		};
 
 		const { stdout, stderr } = await execAsync(`bash "${scriptPath}" 2>&1`, { env });
@@ -831,22 +1043,22 @@ async function runSetupScriptSilently(proxyHost: string, proxyPort: number, prox
 			(output.includes('configured') && !output.includes('Already configured'));
 
 		if (isNewConfig) {
-			// New configuration or version update - setup-proxy.sh terminates old processes
 			log('Setup: New configuration applied');
 			
-			// Wait briefly in case Antigravity IDE v2.6.0+ auto-recovered agy through the new wrapper
+			// Wait 1.5s so that if Antigravity IDE v2.6.0+ just spawned agy --hub right after writing
+			// agy.version.json, its waitForServerReady(/healthz) probe completes and sets serverUrl
+			// (enabling 1s auto-recovery on SIGTERM instead of throwing a startup error).
 			await new Promise(resolve => setTimeout(resolve, 1500));
 			const lsProcess = await getLanguageServerProcess();
-			if (lsProcess && lsProcess.isUsingProxy) {
-				log('Setup: Language Server auto-recovered with proxy active, no reload needed');
+			if (lsProcess && lsProcess.isUsingProxy && lsProcess.pid !== pidBeforeSetup) {
+				log('Setup: Language Server already spawned with new proxy wrapper active, no reload needed');
 				return true;
 			}
-			if (lsProcess && lsProcess.isPersistent && !lsProcess.isUsingProxy) {
-				log('Setup: LS is in persistent_mode without proxy, killing to apply new configuration');
-				const killed = await killLanguageServer();
+			if (lsProcess && lsProcess.isPersistent && (!lsProcess.isUsingProxy || lsProcess.pid === pidBeforeSetup)) {
+				log(`Setup: Restarting persistent LS/agy (PID ${lsProcess.pid}, usingProxy=${lsProcess.isUsingProxy}) to apply new wrapper`);
+				const killed = await killLanguageServer(lsProcess.pid);
 				if (killed) {
-					await new Promise(resolve => setTimeout(resolve, 1500));
-					const rechecked = await getLanguageServerProcess();
+					const rechecked = await waitForProxiedLanguageServer(3500, lsProcess.pid);
 					if (rechecked?.isUsingProxy) {
 						log('Setup: Language Server auto-recovered with proxy active after kill');
 						return true;
@@ -865,8 +1077,15 @@ async function runSetupScriptSilently(proxyHost: string, proxyPort: number, prox
 						}
 					});
 				}
+			} else if (!lsProcess) {
+				// LS not running yet or waiting to start - check briefly if it starts with proxy
+				const started = await waitForProxiedLanguageServer(2000);
+				if (started?.isUsingProxy) {
+					log('Setup: Language Server started with proxy active, no reload needed');
+					return true;
+				}
 			} else {
-				// Non-persistent mode or LS not running - regular reload is fine
+				// Non-persistent mode - regular reload is fine
 				promptReloadWindow(
 					'Antigravity proxy configured. Reload window to apply changes to the language server.'
 				);
@@ -887,11 +1106,16 @@ async function runSetupScriptSilently(proxyHost: string, proxyPort: number, prox
 				log('Setup: Proxy configured but LS not using it');
 				
 				if (lsIsPersistent) {
-					// Persistent mode: LS won't restart on reload, need to kill it first
+					// Persistent mode: kill it so Antigravity v2.6.0+ auto-recovers through wrapper
 					log('Setup: Language Server is in persistent_mode, killing process to force restart through wrapper');
 					
-					const killed = await killLanguageServer();
+					const killed = await killLanguageServer(lsProcess.pid);
 					if (killed) {
+						const rechecked = await waitForProxiedLanguageServer(3500, lsProcess.pid);
+						if (rechecked?.isUsingProxy) {
+							log('Setup: Language Server auto-recovered with proxy active after kill');
+							return true;
+						}
 						promptReloadWindow(
 							'Language Server was restarted to enable proxy. Please reload the window to reconnect.'
 						);

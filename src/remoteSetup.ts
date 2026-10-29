@@ -44,6 +44,17 @@ while IFS= read -r BAK; do
     echo "Restoring: $TARGET"
     [ -f "$TARGET" ] && rm -f "$TARGET"
     mv -f "$BAK" "$TARGET"
+    if [ -f "\${TARGET}.version.json" ]; then
+        read -r SIZE MTIME_SEC INO <<< "\$(stat -c '%s %Y %i' "\$TARGET" 2>/dev/null || true)"
+        if [ -n "\$SIZE" ] && [ -n "\$MTIME_SEC" ] && [ -n "\$INO" ]; then
+            SIDECAR_TMP="\${TARGET}.version.json.tmp.\$\$"
+            sed -E \\
+                -e "s/(\\"size\\"[[:space:]]*:[[:space:]]*)[0-9]+/\\1\${SIZE}/" \\
+                -e "s/(\\"mtimeMs\\"[[:space:]]*:[[:space:]]*)[0-9]+(\\.[0-9]+)?/\\1\${MTIME_SEC}000/" \\
+                -e "s/(\\"ino\\"[[:space:]]*:[[:space:]]*)[0-9]+/\\1\${INO}/" \\
+                "\${TARGET}.version.json" > "\$SIDECAR_TMP" 2>/dev/null && mv -f "\$SIDECAR_TMP" "\${TARGET}.version.json" || rm -f "\$SIDECAR_TMP"
+        fi
+    fi
     RESTORED=$((RESTORED + 1))
 done <<< "$BAKS"
 
